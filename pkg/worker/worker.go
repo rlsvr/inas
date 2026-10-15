@@ -5,6 +5,7 @@ package worker
 
 import (
 	"context"
+	"sync/atomic"
 
 	"github.com/rlsvr/inas/pkg/queue"
 )
@@ -27,10 +28,15 @@ func Run[T any](ctx context.Context, n int, q *queue.Queue[T], dispatch func(con
 		panic("worker: n must be > 0")
 	}
 	p := &Pool{stopped: make(chan struct{})}
-	done := make(chan struct{}, n)
-	for i := 0; i < n; i++ {
+	var remaining atomic.Int32
+	remaining.Store(int32(n)) //nolint:gosec // n > 0 validated above
+	for range n {
 		go func() {
-			defer func() { done <- struct{}{} }()
+			defer func() {
+				if remaining.Add(-1) == 0 {
+					close(p.stopped)
+				}
+			}()
 			for {
 				item, err := q.Pop(ctx)
 				if err != nil {
@@ -40,12 +46,6 @@ func Run[T any](ctx context.Context, n int, q *queue.Queue[T], dispatch func(con
 			}
 		}()
 	}
-	go func() {
-		for i := 0; i < n; i++ {
-			<-done
-		}
-		close(p.stopped)
-	}()
 	return p
 }
 

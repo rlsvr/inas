@@ -173,6 +173,26 @@ func TestConcurrentPushPop(t *testing.T) {
 	}
 }
 
+func TestPopPrioritizesCanceledContext(t *testing.T) {
+	q := queue.New[int](10)
+	for i := 1; i <= 5; i++ {
+		if !q.TryPush(i) {
+			t.Fatalf("TryPush(%d) failed", i)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // canceled before calling Pop
+
+	val, err := q.Pop(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Pop with canceled ctx returned err=%v, val=%d; want context.Canceled", err, val)
+	}
+	if q.Len() != 5 {
+		t.Fatalf("queue length changed: got %d, want 5", q.Len())
+	}
+}
+
 func BenchmarkQueue_TryPushPop(b *testing.B) {
 	q := queue.New[int](b.N + 1)
 	ctx := context.Background()

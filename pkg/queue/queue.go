@@ -69,6 +69,9 @@ func (q *Queue[T]) TryPush(v T) bool {
 // and only returns ErrClosed once the buffer is empty.
 func (q *Queue[T]) Pop(ctx context.Context) (T, error) {
 	var zero T
+	if err := ctx.Err(); err != nil {
+		return zero, err
+	}
 	select {
 	case v := <-q.ch:
 		return v, nil
