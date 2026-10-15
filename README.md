@@ -3,6 +3,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/rlsvr/inas.svg)](https://pkg.go.dev/github.com/rlsvr/inas)
 [![CI](https://github.com/rlsvr/inas/actions/workflows/ci.yml/badge.svg)](https://github.com/rlsvr/inas/actions/workflows/ci.yml)
 [![golangci-lint](https://img.shields.io/badge/golangci--lint-passing-brightgreen?logo=go)](https://github.com/rlsvr/inas/actions/workflows/ci.yml)
+[![govulncheck](https://img.shields.io/badge/govulncheck-passing-brightgreen?logo=go)](https://github.com/rlsvr/inas/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
 **`inas`** (Hungarian for *apprentice / helper / runner*) is a lean, zero-dependency Go library providing generic in-process concurrency primitives: bounded FIFO queues and decoupled worker pools.
