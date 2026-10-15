@@ -1,7 +1,7 @@
 MODULE        := github.com/rlsvr/inas
 GOLANGCI_LINT := golangci-lint
 
-.PHONY: all build test test-verbose bench fmt lint lint-fix check tidy clean
+.PHONY: all build test test-verbose bench fmt lint lint-fix check tidy vulncheck clean
 
 ## all: build + test + lint
 all: build test lint
@@ -40,6 +40,10 @@ tidy:
 
 ## check: fmt + lint + tidy
 check: fmt lint tidy
+
+## vulncheck: run govulncheck on all packages
+vulncheck:
+	go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
 ## clean: remove build artifacts
 clean:
