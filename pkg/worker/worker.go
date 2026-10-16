@@ -22,14 +22,20 @@ type Pool struct {
 // about lifecycle. Each worker exits when q.Pop returns an error (ctx
 // canceled or queue closed).
 //
-// n must be > 0. Panics if not.
+// Panics if n <= 0, q == nil, or dispatch == nil.
 func Run[T any](ctx context.Context, n int, q *queue.Queue[T], dispatch func(context.Context, T)) *Pool {
 	if n <= 0 {
 		panic("worker: n must be > 0")
 	}
+	if q == nil {
+		panic("worker: q must be non-nil")
+	}
+	if dispatch == nil {
+		panic("worker: dispatch must be non-nil")
+	}
 	p := &Pool{stopped: make(chan struct{})}
-	var remaining atomic.Int32
-	remaining.Store(int32(n)) //nolint:gosec // n > 0 validated above
+	var remaining atomic.Int64
+	remaining.Store(int64(n))
 	for range n {
 		go func() {
 			defer func() {

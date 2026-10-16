@@ -20,6 +20,25 @@ func TestRunPanicsOnZero(t *testing.T) {
 	_ = worker.Run(context.Background(), 0, q, func(_ context.Context, _ int) {})
 }
 
+func TestRunPanicsOnNilQueue(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic for nil queue")
+		}
+	}()
+	_ = worker.Run[int](context.Background(), 1, nil, func(_ context.Context, _ int) {})
+}
+
+func TestRunPanicsOnNilDispatch(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic for nil dispatch")
+		}
+	}()
+	q := queue.New[int](4)
+	_ = worker.Run(context.Background(), 1, q, nil)
+}
+
 func TestRunDispatchesAllItems(t *testing.T) {
 	q := queue.New[int](8)
 	var sum atomic.Int64

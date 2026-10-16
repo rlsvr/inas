@@ -15,7 +15,10 @@ var ErrClosed = errors.New("queue: closed")
 // Queue is a thread-safe, bounded, generic FIFO queue.
 type Queue[T any] struct {
 	ch        chan T
+	wake      chan struct{}
 	done      chan struct{}
+	mu        sync.RWMutex
+	closed    bool
 	closeOnce sync.Once
 }
 
@@ -26,22 +29,32 @@ func New[T any](capacity int) *Queue[T] {
 	}
 	return &Queue[T]{
 		ch:   make(chan T, capacity),
+		wake: make(chan struct{}),
 		done: make(chan struct{}),
 	}
 }
 
 // Push blocks until v is enqueued, ctx is canceled, or the queue is closed.
-// If Close races with Push, either delivery or ErrClosed is returned.
+// If Close races with Push, either delivery (before consumers observe Done)
+// or ErrClosed is returned.
 func (q *Queue[T]) Push(ctx context.Context, v T) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	if q.closed {
+		return ErrClosed
+	}
 	select {
-	case <-q.done:
+	case <-q.wake:
 		return ErrClosed
 	default:
 	}
 	select {
 	case q.ch <- v:
 		return nil
-	case <-q.done:
+	case <-q.wake:
 		return ErrClosed
 	case <-ctx.Done():
 		return ctx.Err()
@@ -51,14 +64,21 @@ func (q *Queue[T]) Push(ctx context.Context, v T) error {
 // TryPush enqueues v without blocking. It returns false if the queue is
 // full or closed.
 func (q *Queue[T]) TryPush(v T) bool {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	if q.closed {
+		return false
+	}
 	select {
-	case <-q.done:
+	case <-q.wake:
 		return false
 	default:
 	}
 	select {
 	case q.ch <- v:
 		return true
+	case <-q.wake:
+		return false
 	default:
 		return false
 	}
@@ -92,12 +112,20 @@ func (q *Queue[T]) Pop(ctx context.Context) (T, error) {
 // shutdown.
 func (q *Queue[T]) Recv() <-chan T { return q.ch }
 
-// Done returns a channel that is closed when Close has been called.
+// Done returns a channel that is closed when Close has been called and all
+// in-flight Push/TryPush operations have completed.
 func (q *Queue[T]) Done() <-chan struct{} { return q.done }
 
 // Close is idempotent and safe to call concurrently with Push and Pop.
+// Once Close returns, no further items can be enqueued into the buffer.
 func (q *Queue[T]) Close() {
-	q.closeOnce.Do(func() { close(q.done) })
+	q.closeOnce.Do(func() {
+		close(q.wake)
+		q.mu.Lock()
+		q.closed = true
+		close(q.done)
+		q.mu.Unlock()
+	})
 }
 
 // Len returns the number of currently buffered items.

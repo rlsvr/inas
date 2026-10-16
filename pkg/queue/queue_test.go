@@ -193,6 +193,85 @@ func TestPopPrioritizesCanceledContext(t *testing.T) {
 	}
 }
 
+func TestPushPrioritizesCanceledContext(t *testing.T) {
+	q := queue.New[int](10)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := q.Push(ctx, 42); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Push with canceled ctx on non-full queue = %v; want context.Canceled", err)
+	}
+	if q.Len() != 0 {
+		t.Fatalf("queue length = %d, want 0", q.Len())
+	}
+}
+
+func TestCloseNoOrphanedItemsUnderConcurrentPush(t *testing.T) {
+	for range 200 {
+		q := queue.New[int](4)
+		var pushed, popped int64
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+
+		for range 8 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := range 50 {
+					if i%2 == 0 {
+						if q.TryPush(1) {
+							mu.Lock()
+							pushed++
+							mu.Unlock()
+						}
+					} else {
+						if err := q.Push(context.Background(), 1); err == nil {
+							mu.Lock()
+							pushed++
+							mu.Unlock()
+						}
+					}
+				}
+			}()
+		}
+
+		go func() {
+			time.Sleep(100 * time.Microsecond)
+			q.Close()
+		}()
+
+		for {
+			_, err := q.Pop(context.Background())
+			if err != nil {
+				if !errors.Is(err, queue.ErrClosed) {
+					t.Fatalf("unexpected Pop err: %v", err)
+				}
+				break
+			}
+			popped++
+		}
+
+		wg.Wait()
+
+		select {
+		case <-q.Done():
+		default:
+			t.Fatal("Done() channel should be closed after Close()")
+		}
+		select {
+		case v := <-q.Recv():
+			t.Fatalf("orphaned item %v remained in Recv() after Pop returned ErrClosed", v)
+		default:
+		}
+		mu.Lock()
+		p := pushed
+		mu.Unlock()
+		if p != popped {
+			t.Fatalf("pushed %d items with nil/true, but popped %d items", p, popped)
+		}
+	}
+}
+
 func BenchmarkQueue_TryPushPop(b *testing.B) {
 	q := queue.New[int](b.N + 1)
 	ctx := context.Background()
