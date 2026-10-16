@@ -16,6 +16,7 @@ Designed with **zero external dependencies** (standard library only), `inas` ser
 
 * **`pkg/queue`**: Bounded, generic FIFO queue (`Queue[T]`) supporting blocking `Push` / `Pop` with context cancellation, non-blocking `TryPush` (< 50ns), raw channel `select` integration (`Recv()`), and graceful drain on close.
 * **`pkg/worker`**: Generic worker pool (`Run[T]`, `Pool`) that drains a `Queue[T]` across $N$ goroutines with clean lifecycle management (`Wait()`, `Stopped()`).
+* **`pkg/registry`**: Generic dynamic entry registry (`Registry[K, M]`) with actor-based batched reconfigurations, sub-nanosecond lock-free copy-on-write snapshots (`Snapshot[K, M]`), and debounced lifecycle eviction (`OnActive`, `OnInactive`).
 
 ---
 
@@ -100,6 +101,51 @@ func main() {
 	// Wait for in-flight work to complete
 	_ = pool.Wait(context.Background())
 	fmt.Println("All workers drained and stopped cleanly.")
+}
+```
+
+---
+
+### 3. Dynamic Entry Registry (`pkg/registry`)
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/rlsvr/inas/pkg/registry"
+)
+
+func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Registry of topics (string) with client subscriber IDs (int)
+	reg := registry.New[string, int](ctx, registry.Options{
+		ReconfigInterval: 10 * time.Millisecond,
+		Debounce:         5 * time.Second, // Keep topic warm for 5s after last member leaves
+	}, registry.Hooks[string, int]{
+		OnActive: func(entry string) {
+			fmt.Printf("Entry %s became active (subscribing upstream)\n", entry)
+		},
+		OnInactive: func(entry string) {
+			fmt.Printf("Entry %s became inactive (unsubscribing upstream)\n", entry)
+		},
+	})
+	defer func() { _ = reg.Close() }()
+
+	// Register member 42 into topic "chat-room"
+	unregister := reg.Register([]string{"chat-room"}, 42)
+
+	// Sub-nanosecond lock-free snapshot inspection
+	snap := reg.Snapshot()
+	fmt.Printf("Active members in chat-room: %v\n", snap.Members("chat-room"))
+
+	// Leave room; entry stays warm for 5s before OnInactive fires
+	unregister()
 }
 ```
 
