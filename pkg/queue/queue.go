@@ -61,16 +61,18 @@ func (q *Queue[T]) Push(ctx context.Context, v T) error {
 // full or closed.
 func (q *Queue[T]) TryPush(v T) bool {
 	q.mu.RLock()
-	defer q.mu.RUnlock()
 	select {
 	case <-q.wake:
+		q.mu.RUnlock()
 		return false
 	default:
 	}
 	select {
 	case q.ch <- v:
+		q.mu.RUnlock()
 		return true
 	default:
+		q.mu.RUnlock()
 		return false
 	}
 }

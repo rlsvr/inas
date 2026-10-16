@@ -110,3 +110,25 @@ func TestWaitTimeout(t *testing.T) {
 	}
 	q.Close()
 }
+
+func TestRunRecoversDispatchPanic(t *testing.T) {
+	q := queue.New[int](4)
+	var processed atomic.Int64
+	p := worker.Run(context.Background(), 1, q, func(_ context.Context, v int) {
+		if v == 1 {
+			panic("simulated dispatch panic")
+		}
+		processed.Add(1)
+	})
+
+	_ = q.Push(context.Background(), 1)
+	_ = q.Push(context.Background(), 2)
+	q.Close()
+
+	if err := p.Wait(context.Background()); err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	if processed.Load() != 1 {
+		t.Fatalf("expected item 2 to be processed despite item 1 panic, got %d", processed.Load())
+	}
+}

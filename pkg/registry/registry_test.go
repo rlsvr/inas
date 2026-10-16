@@ -330,3 +330,171 @@ func TestRegistry_CloseDrainsAndCleansUpMembers(t *testing.T) {
 		t.Fatalf("expected 2 OnInactive calls on Close, got %d", inactiveCalls.Load())
 	}
 }
+
+func TestRegistry_DebounceStarvationUnderContinuousLoad(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var inactiveA atomic.Int64
+
+	reg := registry.New[string, string](ctx, registry.Options{
+		ReconfigInterval: 20 * time.Millisecond,
+		ReconfigWait:     true,
+		Debounce:         25 * time.Millisecond,
+	}, registry.Hooks[string, string]{
+		OnInactive: func(entry string) {
+			if entry == "topic-A" {
+				inactiveA.Add(1)
+			}
+		},
+	})
+	defer func() { _ = reg.Close() }()
+
+	// Register and immediately deregister topic-A so it enters debounce eviction
+	unsubA := reg.Register([]string{"topic-A"}, "user-A")
+	unsubA()
+
+	// While topic-A is in debounce, continuously hammer topic-B with immediate flushes
+	stopLoad := make(chan struct{})
+	loadDone := make(chan struct{})
+	go func() {
+		defer close(loadDone)
+		i := 0
+		for {
+			select {
+			case <-stopLoad:
+				return
+			default:
+				unsub := reg.Register([]string{"topic-B"}, string(rune('a'+(i%26))))
+				unsub()
+				i++
+			}
+		}
+	}()
+
+	// Wait 80ms (more than 3x the 25ms debounce)
+	time.Sleep(80 * time.Millisecond)
+	close(stopLoad)
+	<-loadDone
+
+	// topic-A must have been evicted despite the heavy continuous traffic on topic-B
+	if inactiveA.Load() != 1 {
+		t.Fatalf("debounce was starved by continuous load! inactiveA calls = %d, expected 1", inactiveA.Load())
+	}
+}
+
+func TestRegistry_SliceClipSafety(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	reg := registry.New[string, string](ctx, registry.Options{
+		ReconfigInterval: 5 * time.Millisecond,
+		ReconfigWait:     true,
+	}, registry.Hooks[string, string]{})
+	defer func() { _ = reg.Close() }()
+
+	_ = reg.Register([]string{"clip-room-1", "clip-room-2"}, "alice")
+	_ = reg.Register([]string{"clip-room-1"}, "bob")
+
+	snap := reg.Snapshot()
+	members := snap.Members("clip-room-1")
+	if len(members) != 2 {
+		t.Fatalf("expected 2 members, got %d", len(members))
+	}
+	if cap(members) != len(members) {
+		t.Fatalf("expected cap(members) == len(members) due to slices.Clip, got cap=%d len=%d", cap(members), len(members))
+	}
+
+	entries := snap.Entries()
+	if cap(entries) != len(entries) {
+		t.Fatalf("expected cap(entries) == len(entries) due to slices.Clip, got cap=%d len=%d", cap(entries), len(entries))
+	}
+
+	all := snap.AllMembers()
+	if cap(all) != len(all) {
+		t.Fatalf("expected cap(all) == len(all) due to slices.Clip, got cap=%d len=%d", cap(all), len(all))
+	}
+
+	// Appending to members should not corrupt the snapshot because capacity is fully clipped
+	_ = append(members, "evil-intruder")
+	membersAfter := snap.Members("clip-room-1")
+	if len(membersAfter) != 2 {
+		t.Fatalf("snapshot slice was corrupted by caller append: %v", membersAfter)
+	}
+}
+
+func TestRegistry_ActorPanicUnblocksCallers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var panicOnce sync.Once
+	reg := registry.New[string, string](ctx, registry.Options{
+		ReconfigInterval: 5 * time.Millisecond,
+		ReconfigWait:     true,
+	}, registry.Hooks[string, string]{
+		OnRegister: func(entry, member string) {
+			if entry == "panic-topic" {
+				panicOnce.Do(func() {
+					panic("simulated hook panic")
+				})
+			}
+		},
+	})
+	defer func() { _ = reg.Close() }()
+
+	// Trigger the panic in actor
+	go func() {
+		defer func() { _ = recover() }()
+		_ = reg.Register([]string{"panic-topic"}, "user-p")
+	}()
+
+	// Wait briefly for the actor to encounter the panic
+	time.Sleep(20 * time.Millisecond)
+
+	// Now a second caller should not deadlock if it tries to register or unregister
+	done := make(chan struct{})
+	go func() {
+		_ = reg.Register([]string{"other-topic"}, "user-2")
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success: caller was unblocked and did not hang
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("caller deadlocked after actor panic!")
+	}
+}
+
+func TestRegistry_DrainAndCloseWithPendingDeregister(t *testing.T) {
+	ctx := context.Background()
+
+	var deregCalls atomic.Int64
+	var inactiveCalls atomic.Int64
+
+	reg := registry.New[string, string](ctx, registry.Options{
+		ReconfigInterval: 50 * time.Millisecond, // slow reconfig so deregister is queued
+		ReconfigWait:     false,
+	}, registry.Hooks[string, string]{
+		OnDeregister: func(entry, member string) {
+			deregCalls.Add(1)
+		},
+		OnInactive: func(entry string) {
+			inactiveCalls.Add(1)
+		},
+	})
+
+	unsub := reg.Register([]string{"t1"}, "m1")
+	time.Sleep(10 * time.Millisecond)
+
+	// Fire unsub (enqueued in reqCh without waiting) and immediately Close
+	unsub()
+	_ = reg.Close()
+
+	if deregCalls.Load() != 1 {
+		t.Fatalf("expected exactly 1 OnDeregister call, got %d", deregCalls.Load())
+	}
+	if inactiveCalls.Load() != 1 {
+		t.Fatalf("expected exactly 1 OnInactive call, got %d", inactiveCalls.Load())
+	}
+}

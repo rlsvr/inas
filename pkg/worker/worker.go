@@ -21,6 +21,20 @@ type Pool struct {
 	stopped chan struct{}
 }
 
+// isNilSource checks whether q is nil or holds a nil pointer, channel, func, interface, map, or slice.
+func isNilSource[T any](q Source[T]) bool {
+	if q == nil {
+		return true
+	}
+	v := reflect.ValueOf(q)
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Slice:
+		return v.IsNil()
+	default:
+		return false
+	}
+}
+
 // Run spawns n goroutines that each pop from q and call dispatch(ctx, item).
 // dispatch is expected to handle its own errors; the pool itself only cares
 // about lifecycle. Each worker exits when q.Pop returns an error (ctx
@@ -31,7 +45,7 @@ func Run[T any](ctx context.Context, n int, q Source[T], dispatch func(context.C
 	if n <= 0 {
 		panic("worker: n must be > 0")
 	}
-	if q == nil || (reflect.ValueOf(q).Kind() == reflect.Pointer && reflect.ValueOf(q).IsNil()) {
+	if isNilSource(q) {
 		panic("worker: q must be non-nil")
 	}
 	if dispatch == nil {
@@ -52,7 +66,12 @@ func Run[T any](ctx context.Context, n int, q Source[T], dispatch func(context.C
 				if err != nil {
 					return
 				}
-				dispatch(ctx, item)
+				func() {
+					defer func() {
+						_ = recover()
+					}()
+					dispatch(ctx, item)
+				}()
 			}
 		}()
 	}
