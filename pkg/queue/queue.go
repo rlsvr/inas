@@ -18,7 +18,6 @@ type Queue[T any] struct {
 	wake      chan struct{}
 	done      chan struct{}
 	mu        sync.RWMutex
-	closed    bool
 	closeOnce sync.Once
 }
 
@@ -43,9 +42,6 @@ func (q *Queue[T]) Push(ctx context.Context, v T) error {
 	}
 	q.mu.RLock()
 	defer q.mu.RUnlock()
-	if q.closed {
-		return ErrClosed
-	}
 	select {
 	case <-q.wake:
 		return ErrClosed
@@ -66,9 +62,6 @@ func (q *Queue[T]) Push(ctx context.Context, v T) error {
 func (q *Queue[T]) TryPush(v T) bool {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
-	if q.closed {
-		return false
-	}
 	select {
 	case <-q.wake:
 		return false
@@ -77,8 +70,6 @@ func (q *Queue[T]) TryPush(v T) bool {
 	select {
 	case q.ch <- v:
 		return true
-	case <-q.wake:
-		return false
 	default:
 		return false
 	}
@@ -122,7 +113,6 @@ func (q *Queue[T]) Close() {
 	q.closeOnce.Do(func() {
 		close(q.wake)
 		q.mu.Lock()
-		q.closed = true
 		close(q.done)
 		q.mu.Unlock()
 	})

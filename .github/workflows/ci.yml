@@ -40,7 +40,7 @@ jobs:
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.13
+          version: latest
 
   vulncheck:
     name: Vulnerability Check
@@ -50,8 +50,15 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          check-latest: true
+
       - name: Run govulncheck
         uses: golang/govulncheck-action@v1
         with:
           go-package: ./...
           repo-checkout: 'false'
+

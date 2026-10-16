@@ -5,6 +5,7 @@ package registry
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,6 +35,9 @@ type Options struct {
 
 // Hooks provides optional lifecycle callbacks. All callbacks are invoked sequentially
 // inside the actor goroutine, so they do not race with registry mutations.
+//
+// WARNING: Callbacks MUST NOT synchronously call Register (with ReconfigWait) or Close
+// on the same Registry instance, as doing so will deadlock the actor goroutine.
 type Hooks[K comparable, M comparable] struct {
 	// OnActive is called when an entry transitions from 0 to 1 active members.
 	OnActive func(entry K)
@@ -65,6 +69,7 @@ func newEmptySnapshot[K comparable, M comparable]() *Snapshot[K, M] {
 
 // Members returns a pre-sliced slice of members registered under entry.
 // Returns nil if the entry does not exist or has no active members.
+// The returned slice is shared across readers and MUST NOT be mutated.
 func (s *Snapshot[K, M]) Members(entry K) []M {
 	if s == nil {
 		return nil
@@ -94,6 +99,7 @@ func (s *Snapshot[K, M]) HasMember(entry K, member M) bool {
 }
 
 // Entries returns all active entry keys in this snapshot.
+// The returned slice is shared across readers and MUST NOT be mutated.
 func (s *Snapshot[K, M]) Entries() []K {
 	if s == nil {
 		return nil
@@ -102,6 +108,7 @@ func (s *Snapshot[K, M]) Entries() []K {
 }
 
 // AllMembers returns a deduplicated slice of all active members across all entries.
+// The returned slice is shared across readers and MUST NOT be mutated.
 func (s *Snapshot[K, M]) AllMembers() []M {
 	if s == nil {
 		return nil
@@ -171,13 +178,16 @@ func (r *Registry[K, M]) Register(entries []K, member M) func() {
 		return func() {}
 	}
 
+	// Defensive copy to prevent caller slice mutation from corrupting actor state or unregister closure.
+	entriesCopy := slices.Clone(entries)
+
 	var done chan struct{}
 	if r.opts.ReconfigWait {
 		done = make(chan struct{})
 	}
 
 	select {
-	case r.reqCh <- request[K, M]{op: opRegister, entries: entries, member: member, done: done}:
+	case r.reqCh <- request[K, M]{op: opRegister, entries: entriesCopy, member: member, done: done}:
 		if done != nil {
 			select {
 			case <-done:
@@ -198,7 +208,7 @@ func (r *Registry[K, M]) Register(entries []K, member M) func() {
 			}
 
 			select {
-			case r.reqCh <- request[K, M]{op: opDeregister, entries: entries, member: member, done: unsubDone}:
+			case r.reqCh <- request[K, M]{op: opDeregister, entries: entriesCopy, member: member, done: unsubDone}:
 				if unsubDone != nil {
 					select {
 					case <-unsubDone:
@@ -234,6 +244,7 @@ func (r *Registry[K, M]) runActor() {
 	batch := make([]request[K, M], 0, batchCap)
 
 	timer := time.NewTimer(interval)
+	timerActive := true
 	defer timer.Stop()
 
 	// Actor-owned state
@@ -243,30 +254,55 @@ func (r *Registry[K, M]) runActor() {
 	for {
 		select {
 		case <-r.ctx.Done():
-			r.drainAndClose(batch, liveEntries, evictAt)
+			r.drainAndClose(batch, liveEntries)
 			return
 
 		case req := <-r.reqCh:
 			batch = append(batch, req)
-			if len(batch) >= batchCap || req.done != nil {
+			needImmediateFlush := req.done != nil
+
+			// Opportunistically drain queued requests up to batchCap
+		drainQueue:
+			for len(batch) < batchCap {
+				select {
+				case nextReq := <-r.reqCh:
+					batch = append(batch, nextReq)
+					if nextReq.done != nil {
+						needImmediateFlush = true
+					}
+				default:
+					break drainQueue
+				}
+			}
+
+			if len(batch) >= batchCap || needImmediateFlush {
 				r.applyBatch(batch, liveEntries, evictAt)
 				batch = batch[:0]
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
+				if timerActive {
+					stopTimer(timer)
+					timerActive = false
 				}
+				if len(evictAt) > 0 {
+					timer.Reset(interval)
+					timerActive = true
+				}
+			} else if !timerActive {
 				timer.Reset(interval)
+				timerActive = true
 			}
 
 		case now := <-timer.C:
+			timerActive = false
 			r.checkDebounce(now, liveEntries, evictAt)
 			if len(batch) > 0 {
 				r.applyBatch(batch, liveEntries, evictAt)
 				batch = batch[:0]
 			}
-			timer.Reset(interval)
+			// Only keep timer ticking if there are pending items or active debounce timers
+			if len(batch) > 0 || len(evictAt) > 0 {
+				timer.Reset(interval)
+				timerActive = true
+			}
 		}
 	}
 }
@@ -307,6 +343,9 @@ func (r *Registry[K, M]) applyRegister(entry K, member M, live map[K]map[M]struc
 	} else {
 		delete(evictAt, entry)
 	}
+	if _, alreadyMember := set[member]; alreadyMember {
+		return
+	}
 	set[member] = struct{}{}
 	if r.hooks.OnRegister != nil {
 		r.hooks.OnRegister(entry, member)
@@ -316,6 +355,9 @@ func (r *Registry[K, M]) applyRegister(entry K, member M, live map[K]map[M]struc
 func (r *Registry[K, M]) applyDeregister(entry K, member M, live map[K]map[M]struct{}, evictAt map[K]time.Time, now time.Time) {
 	set, exists := live[entry]
 	if !exists {
+		return
+	}
+	if _, isMember := set[member]; !isMember {
 		return
 	}
 	delete(set, member)
@@ -359,8 +401,8 @@ func (r *Registry[K, M]) publishSnapshot(live map[K]map[M]struct{}) {
 	snapMembers := make(map[K][]M, len(live))
 	snapMemberSets := make(map[K]map[M]struct{}, len(live))
 	entries := make([]K, 0, len(live))
-	allSeen := make(map[M]struct{})
-	var allMembers []M
+	allSeen := make(map[M]struct{}, len(live)*2)
+	allMembers := make([]M, 0, len(live)*2)
 
 	for entry, set := range live {
 		if len(set) == 0 {
@@ -390,7 +432,7 @@ func (r *Registry[K, M]) publishSnapshot(live map[K]map[M]struct{}) {
 	})
 }
 
-func (r *Registry[K, M]) drainAndClose(batch []request[K, M], live map[K]map[M]struct{}, evictAt map[K]time.Time) {
+func (r *Registry[K, M]) drainAndClose(batch []request[K, M], live map[K]map[M]struct{}) {
 	// Drain any in-flight batch
 	for _, req := range batch {
 		if req.done != nil {
@@ -398,6 +440,7 @@ func (r *Registry[K, M]) drainAndClose(batch []request[K, M], live map[K]map[M]s
 		}
 	}
 	// Drain channel
+drainLoop:
 	for {
 		select {
 		case req := <-r.reqCh:
@@ -405,22 +448,19 @@ func (r *Registry[K, M]) drainAndClose(batch []request[K, M], live map[K]map[M]s
 				close(req.done)
 			}
 		default:
-			goto finish
+			break drainLoop
 		}
 	}
 
-finish:
-	// Invoke OnInactive for all remaining live entries and pending evictions
-	for entry := range live {
+	// Invoke OnDeregister for all remaining members and OnInactive for all remaining entries
+	for entry, set := range live {
+		if r.hooks.OnDeregister != nil {
+			for member := range set {
+				r.hooks.OnDeregister(entry, member)
+			}
+		}
 		if r.hooks.OnInactive != nil {
 			r.hooks.OnInactive(entry)
-		}
-	}
-	for entry := range evictAt {
-		if _, stillLive := live[entry]; !stillLive {
-			if r.hooks.OnInactive != nil {
-				r.hooks.OnInactive(entry)
-			}
 		}
 	}
 
@@ -434,4 +474,13 @@ func (r *Registry[K, M]) Close() error {
 		<-r.actorDone
 	})
 	return nil
+}
+
+func stopTimer(t *time.Timer) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
 }

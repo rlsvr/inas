@@ -1,19 +1,21 @@
-package registry
+package registry_test
 
 import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/rlsvr/inas/pkg/registry"
 )
 
 func BenchmarkRegistry_SnapshotRead(b *testing.B) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	reg := New[string, int](ctx, Options{
+	reg := registry.New[string, int](ctx, registry.Options{
 		ReconfigInterval: 5 * time.Millisecond,
 		ReconfigWait:     true,
-	}, Hooks[string, int]{})
+	}, registry.Hooks[string, int]{})
 	defer func() { _ = reg.Close() }()
 
 	for i := 0; i < 100; i++ {
@@ -36,11 +38,11 @@ func BenchmarkRegistry_RegisterDeregister(b *testing.B) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	reg := New[string, int](ctx, Options{
+	reg := registry.New[string, int](ctx, registry.Options{
 		ReconfigInterval:  10 * time.Millisecond,
 		ReconfigBatchSize: 256,
 		ReconfigWait:      false,
-	}, Hooks[string, int]{})
+	}, registry.Hooks[string, int]{})
 	defer func() { _ = reg.Close() }()
 
 	b.ResetTimer()

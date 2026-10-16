@@ -1,4 +1,4 @@
-package registry
+package registry_test
 
 import (
 	"context"
@@ -6,6 +6,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/rlsvr/inas/pkg/registry"
 )
 
 func TestRegistry_BasicLifecycle(t *testing.T) {
@@ -17,11 +19,11 @@ func TestRegistry_BasicLifecycle(t *testing.T) {
 	var regCalls atomic.Int64
 	var deregCalls atomic.Int64
 
-	reg := New[string, int](ctx, Options{
+	reg := registry.New[string, int](ctx, registry.Options{
 		ReconfigInterval:  5 * time.Millisecond,
 		ReconfigBatchSize: 10,
 		ReconfigWait:      true,
-	}, Hooks[string, int]{
+	}, registry.Hooks[string, int]{
 		OnActive: func(entry string) {
 			activeCalls.Add(1)
 		},
@@ -92,6 +94,85 @@ func TestRegistry_BasicLifecycle(t *testing.T) {
 	}
 }
 
+func TestRegistry_SliceMutationDefense(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	reg := registry.New[string, int](ctx, registry.Options{
+		ReconfigInterval: 5 * time.Millisecond,
+		ReconfigWait:     true,
+	}, registry.Hooks[string, int]{})
+	defer func() { _ = reg.Close() }()
+
+	entries := []string{"topic-orig-1", "topic-orig-2"}
+	unsub := reg.Register(entries, 42)
+
+	// Mutate caller slice after Register
+	entries[0] = "mutated-1"
+	entries[1] = "mutated-2"
+
+	snap := reg.Snapshot()
+	if !snap.HasMember("topic-orig-1", 42) || !snap.HasMember("topic-orig-2", 42) {
+		t.Fatal("expected original entries to contain member despite caller slice mutation")
+	}
+	if snap.HasMember("mutated-1", 42) {
+		t.Fatal("registry state was corrupted by caller slice mutation")
+	}
+
+	// Unsubscribe should properly target the original cloned entries
+	unsub()
+
+	snapAfter := reg.Snapshot()
+	if snapAfter.MemberCount("topic-orig-1") != 0 || snapAfter.MemberCount("topic-orig-2") != 0 {
+		t.Fatal("expected original entries to be emptied by unregister")
+	}
+}
+
+func TestRegistry_DuplicateMemberIdempotence(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var regCalls atomic.Int64
+	var deregCalls atomic.Int64
+
+	reg := registry.New[string, string](ctx, registry.Options{
+		ReconfigInterval: 5 * time.Millisecond,
+		ReconfigWait:     true,
+	}, registry.Hooks[string, string]{
+		OnRegister: func(entry, member string) {
+			regCalls.Add(1)
+		},
+		OnDeregister: func(entry, member string) {
+			deregCalls.Add(1)
+		},
+	})
+	defer func() { _ = reg.Close() }()
+
+	unsub1 := reg.Register([]string{"room"}, "alice")
+	// Duplicate register of the same member
+	unsub2 := reg.Register([]string{"room"}, "alice")
+
+	// OnRegister should only be called once
+	if regCalls.Load() != 1 {
+		t.Fatalf("expected 1 OnRegister call, got %d", regCalls.Load())
+	}
+	if reg.MemberCount("room") != 1 {
+		t.Fatalf("expected member count 1, got %d", reg.MemberCount("room"))
+	}
+
+	unsub1()
+	// Deregistering member should fire OnDeregister once
+	if deregCalls.Load() != 1 {
+		t.Fatalf("expected 1 OnDeregister call, got %d", deregCalls.Load())
+	}
+
+	// Second deregister of now-absent member should be a no-op
+	unsub2()
+	if deregCalls.Load() != 1 {
+		t.Fatalf("expected deregCalls to remain 1, got %d", deregCalls.Load())
+	}
+}
+
 func TestRegistry_DebounceAndRevival(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -99,12 +180,12 @@ func TestRegistry_DebounceAndRevival(t *testing.T) {
 	var activeCalls atomic.Int64
 	var inactiveCalls atomic.Int64
 
-	reg := New[string, string](ctx, Options{
+	reg := registry.New[string, string](ctx, registry.Options{
 		ReconfigInterval:  5 * time.Millisecond,
 		ReconfigBatchSize: 10,
 		ReconfigWait:      true,
 		Debounce:          40 * time.Millisecond, // 40ms debounce window
-	}, Hooks[string, string]{
+	}, registry.Hooks[string, string]{
 		OnActive: func(entry string) {
 			activeCalls.Add(1)
 		},
@@ -166,10 +247,10 @@ func TestRegistry_AllMembersDeduplication(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	reg := New[string, string](ctx, Options{
+	reg := registry.New[string, string](ctx, registry.Options{
 		ReconfigInterval: 5 * time.Millisecond,
 		ReconfigWait:     true,
-	}, Hooks[string, string]{})
+	}, registry.Hooks[string, string]{})
 	defer func() { _ = reg.Close() }()
 
 	unsub1 := reg.Register([]string{"topic-1", "topic-2"}, "client-A")
@@ -188,12 +269,12 @@ func TestRegistry_ConcurrentRace(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	reg := New[string, int](ctx, Options{
+	reg := registry.New[string, int](ctx, registry.Options{
 		ReconfigInterval:  2 * time.Millisecond,
 		ReconfigBatchSize: 64,
 		ReconfigWait:      false,
 		Debounce:          5 * time.Millisecond,
-	}, Hooks[string, int]{})
+	}, registry.Hooks[string, int]{})
 	defer func() { _ = reg.Close() }()
 
 	var wg sync.WaitGroup
@@ -216,28 +297,35 @@ func TestRegistry_ConcurrentRace(t *testing.T) {
 	wg.Wait()
 }
 
-func TestRegistry_CloseDrainsCleanly(t *testing.T) {
+func TestRegistry_CloseDrainsAndCleansUpMembers(t *testing.T) {
 	ctx := context.Background()
 
 	var inactiveCalls atomic.Int64
+	var deregCalls atomic.Int64
 
-	reg := New[string, string](ctx, Options{
+	reg := registry.New[string, string](ctx, registry.Options{
 		ReconfigInterval: 5 * time.Millisecond,
 		ReconfigWait:     true,
 		Debounce:         10 * time.Second, // Long debounce
-	}, Hooks[string, string]{
+	}, registry.Hooks[string, string]{
 		OnInactive: func(entry string) {
 			inactiveCalls.Add(1)
+		},
+		OnDeregister: func(entry, member string) {
+			deregCalls.Add(1)
 		},
 	})
 
 	_ = reg.Register([]string{"channel-1", "channel-2"}, "user-1")
 
-	// Close immediately; should invoke OnInactive for both active entries
+	// Close immediately; should invoke OnDeregister for the active member and OnInactive for both entries
 	if err := reg.Close(); err != nil {
 		t.Fatalf("unexpected close error: %v", err)
 	}
 
+	if deregCalls.Load() != 2 {
+		t.Fatalf("expected 2 OnDeregister calls on Close, got %d", deregCalls.Load())
+	}
 	if inactiveCalls.Load() != 2 {
 		t.Fatalf("expected 2 OnInactive calls on Close, got %d", inactiveCalls.Load())
 	}

@@ -23,10 +23,20 @@ func TestRunPanicsOnZero(t *testing.T) {
 func TestRunPanicsOnNilQueue(t *testing.T) {
 	defer func() {
 		if recover() == nil {
-			t.Fatal("expected panic for nil queue")
+			t.Fatal("expected panic for untyped nil queue")
 		}
 	}()
 	_ = worker.Run[int](context.Background(), 1, nil, func(_ context.Context, _ int) {})
+}
+
+func TestRunPanicsOnTypedNilQueue(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic for typed nil queue pointer")
+		}
+	}()
+	var q *queue.Queue[int]
+	_ = worker.Run[int](context.Background(), 1, q, func(_ context.Context, _ int) {})
 }
 
 func TestRunPanicsOnNilDispatch(t *testing.T) {

@@ -1,14 +1,18 @@
-// Package worker provides a small generic worker pool that drains a
-// queue.Queue[T] by calling a dispatch func on each item until the queue
-// is closed or the context is canceled.
+// Package worker provides a generic worker pool that drains a Source[T]
+// by calling a dispatch func on each item until the queue is closed or
+// the context is canceled.
 package worker
 
 import (
 	"context"
+	"reflect"
 	"sync/atomic"
-
-	"github.com/rlsvr/inas/pkg/queue"
 )
+
+// Source represents any queue or consumer from which items can be popped.
+type Source[T any] interface {
+	Pop(ctx context.Context) (T, error)
+}
 
 // Pool is a running set of N workers fanning items out of a queue into
 // a dispatch func. Pool stops when the queue is closed or the context
@@ -23,11 +27,11 @@ type Pool struct {
 // canceled or queue closed).
 //
 // Panics if n <= 0, q == nil, or dispatch == nil.
-func Run[T any](ctx context.Context, n int, q *queue.Queue[T], dispatch func(context.Context, T)) *Pool {
+func Run[T any](ctx context.Context, n int, q Source[T], dispatch func(context.Context, T)) *Pool {
 	if n <= 0 {
 		panic("worker: n must be > 0")
 	}
-	if q == nil {
+	if q == nil || (reflect.ValueOf(q).Kind() == reflect.Pointer && reflect.ValueOf(q).IsNil()) {
 		panic("worker: q must be non-nil")
 	}
 	if dispatch == nil {
