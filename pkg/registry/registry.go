@@ -121,13 +121,16 @@ type opType uint8
 const (
 	opRegister opType = iota
 	opDeregister
+	opDeregisterMember
 )
 
 type request[K comparable, M comparable] struct {
-	op      opType
-	entries []K
-	member  M
-	done    chan struct{}
+	op        opType
+	member    M
+	singleKey K
+	multiKeys []K
+	hasSingle bool
+	done      chan struct{}
 }
 
 // Registry manages dynamic associations between entries (K) and members (M)
@@ -171,23 +174,25 @@ func New[K comparable, M comparable](ctx context.Context, opts Options, hooks Ho
 	return r
 }
 
-// Register registers member under the given entries. It returns an idempotent deregister func.
+// Register registers member under a single entry without allocating a slice.
+// It returns an idempotent deregister func targeting this specific entry.
 // If ReconfigWait is true, Register blocks until the actor applies the registration.
-func (r *Registry[K, M]) Register(entries []K, member M) func() {
-	if len(entries) == 0 {
-		return func() {}
-	}
-
-	// Defensive copy to prevent caller slice mutation from corrupting actor state or unregister closure.
-	entriesCopy := slices.Clone(entries)
-
+func (r *Registry[K, M]) Register(entry K, member M) func() {
 	var done chan struct{}
 	if r.opts.ReconfigWait {
 		done = make(chan struct{})
 	}
 
+	req := request[K, M]{
+		op:        opRegister,
+		member:    member,
+		singleKey: entry,
+		hasSingle: true,
+		done:      done,
+	}
+
 	select {
-	case r.reqCh <- request[K, M]{op: opRegister, entries: entriesCopy, member: member, done: done}:
+	case r.reqCh <- req:
 		if done != nil {
 			select {
 			case <-done:
@@ -202,22 +207,109 @@ func (r *Registry[K, M]) Register(entries []K, member M) func() {
 	var deregOnce sync.Once
 	return func() {
 		deregOnce.Do(func() {
-			var unsubDone chan struct{}
-			if r.opts.ReconfigWait {
-				unsubDone = make(chan struct{})
-			}
+			r.Deregister(entry, member)
+		})
+	}
+}
 
+// RegisterMulti registers member under multiple entries.
+// It returns an idempotent deregister func targeting these specific entries.
+func (r *Registry[K, M]) RegisterMulti(entries []K, member M) func() {
+	if len(entries) == 0 {
+		return func() {}
+	}
+	if len(entries) == 1 {
+		return r.Register(entries[0], member)
+	}
+
+	// Defensive copy to prevent caller slice mutation from corrupting actor state or unregister closure.
+	entriesCopy := slices.Clone(entries)
+
+	var done chan struct{}
+	if r.opts.ReconfigWait {
+		done = make(chan struct{})
+	}
+
+	req := request[K, M]{
+		op:        opRegister,
+		member:    member,
+		multiKeys: entriesCopy,
+		hasSingle: false,
+		done:      done,
+	}
+
+	select {
+	case r.reqCh <- req:
+		if done != nil {
 			select {
-			case r.reqCh <- request[K, M]{op: opDeregister, entries: entriesCopy, member: member, done: unsubDone}:
-				if unsubDone != nil {
-					select {
-					case <-unsubDone:
-					case <-r.ctx.Done():
-					}
-				}
+			case <-done:
 			case <-r.ctx.Done():
+				return func() {}
+			}
+		}
+	case <-r.ctx.Done():
+		return func() {}
+	}
+
+	var deregOnce sync.Once
+	return func() {
+		deregOnce.Do(func() {
+			for _, e := range entriesCopy {
+				r.Deregister(e, member)
 			}
 		})
+	}
+}
+
+// Deregister removes member from the specified entry.
+func (r *Registry[K, M]) Deregister(entry K, member M) {
+	var done chan struct{}
+	if r.opts.ReconfigWait {
+		done = make(chan struct{})
+	}
+
+	req := request[K, M]{
+		op:        opDeregister,
+		member:    member,
+		singleKey: entry,
+		hasSingle: true,
+		done:      done,
+	}
+
+	select {
+	case r.reqCh <- req:
+		if done != nil {
+			select {
+			case <-done:
+			case <-r.ctx.Done():
+			}
+		}
+	case <-r.ctx.Done():
+	}
+}
+
+// DeregisterMember removes member from all registered entries.
+func (r *Registry[K, M]) DeregisterMember(member M) {
+	var done chan struct{}
+	if r.opts.ReconfigWait {
+		done = make(chan struct{})
+	}
+
+	req := request[K, M]{
+		op:     opDeregisterMember,
+		member: member,
+		done:   done,
+	}
+
+	select {
+	case r.reqCh <- req:
+		if done != nil {
+			select {
+			case <-done:
+			case <-r.ctx.Done():
+			}
+		}
+	case <-r.ctx.Done():
 	}
 }
 
@@ -263,14 +355,15 @@ func (r *Registry[K, M]) runActor() {
 	timerActive := true
 	defer timer.Stop()
 
-	// Actor-owned state
+	// Actor-owned state: bidirectional index
 	liveEntries := make(map[K]map[M]struct{})
+	liveMembers := make(map[M]map[K]struct{})
 	evictAt := make(map[K]time.Time)
 
 	for {
 		select {
 		case <-r.ctx.Done():
-			r.drainAndClose(batch, liveEntries)
+			r.drainAndClose(batch, liveEntries, liveMembers)
 			return
 
 		case req := <-r.reqCh:
@@ -293,7 +386,7 @@ func (r *Registry[K, M]) runActor() {
 
 			if len(batch) >= batchCap || needImmediateFlush {
 				now := time.Now()
-				r.applyBatch(now, batch, liveEntries, evictAt)
+				r.applyBatch(now, batch, liveEntries, liveMembers, evictAt)
 				r.checkDebounce(now, liveEntries, evictAt)
 				clear(batch)
 				batch = batch[:0]
@@ -313,7 +406,7 @@ func (r *Registry[K, M]) runActor() {
 		case now := <-timer.C:
 			timerActive = false
 			if len(batch) > 0 {
-				r.applyBatch(now, batch, liveEntries, evictAt)
+				r.applyBatch(now, batch, liveEntries, liveMembers, evictAt)
 				clear(batch)
 				batch = batch[:0]
 			}
@@ -327,28 +420,44 @@ func (r *Registry[K, M]) runActor() {
 	}
 }
 
-func (r *Registry[K, M]) applyBatch(now time.Time, batch []request[K, M], live map[K]map[M]struct{}, evictAt map[K]time.Time) {
+func (r *Registry[K, M]) applyBatch(now time.Time, batch []request[K, M], liveEntries map[K]map[M]struct{}, liveMembers map[M]map[K]struct{}, evictAt map[K]time.Time) {
 	dirty := make(map[K]struct{})
 
 	for _, req := range batch {
 		switch req.op {
 		case opRegister:
-			for _, entry := range req.entries {
-				if r.applyRegister(entry, req.member, live, evictAt) {
-					dirty[entry] = struct{}{}
+			if req.hasSingle {
+				if r.applyRegister(req.singleKey, req.member, liveEntries, liveMembers, evictAt) {
+					dirty[req.singleKey] = struct{}{}
+				}
+			} else {
+				for _, entry := range req.multiKeys {
+					if r.applyRegister(entry, req.member, liveEntries, liveMembers, evictAt) {
+						dirty[entry] = struct{}{}
+					}
 				}
 			}
 		case opDeregister:
-			for _, entry := range req.entries {
-				if r.applyDeregister(entry, req.member, live, evictAt, now) {
-					dirty[entry] = struct{}{}
+			if r.applyDeregister(req.singleKey, req.member, liveEntries, liveMembers, evictAt, now) {
+				dirty[req.singleKey] = struct{}{}
+			}
+		case opDeregisterMember:
+			if memberEntries, exists := liveMembers[req.member]; exists {
+				entriesToRemove := make([]K, 0, len(memberEntries))
+				for entry := range memberEntries {
+					entriesToRemove = append(entriesToRemove, entry)
+				}
+				for _, entry := range entriesToRemove {
+					if r.applyDeregister(entry, req.member, liveEntries, liveMembers, evictAt, now) {
+						dirty[entry] = struct{}{}
+					}
 				}
 			}
 		}
 	}
 
 	if len(dirty) > 0 {
-		r.publishSnapshot(live, dirty)
+		r.publishSnapshot(liveEntries, dirty)
 	}
 
 	for _, req := range batch {
@@ -356,11 +465,11 @@ func (r *Registry[K, M]) applyBatch(now time.Time, batch []request[K, M], live m
 	}
 }
 
-func (r *Registry[K, M]) applyRegister(entry K, member M, live map[K]map[M]struct{}, evictAt map[K]time.Time) bool {
-	set, exists := live[entry]
+func (r *Registry[K, M]) applyRegister(entry K, member M, liveEntries map[K]map[M]struct{}, liveMembers map[M]map[K]struct{}, evictAt map[K]time.Time) bool {
+	set, exists := liveEntries[entry]
 	if !exists {
 		set = make(map[M]struct{})
-		live[entry] = set
+		liveEntries[entry] = set
 		safeCall1(r.hooks.OnActive, entry)
 	} else {
 		delete(evictAt, entry)
@@ -369,12 +478,20 @@ func (r *Registry[K, M]) applyRegister(entry K, member M, live map[K]map[M]struc
 		return false
 	}
 	set[member] = struct{}{}
+
+	memberEntries, memExists := liveMembers[member]
+	if !memExists {
+		memberEntries = make(map[K]struct{})
+		liveMembers[member] = memberEntries
+	}
+	memberEntries[entry] = struct{}{}
+
 	safeCall2(r.hooks.OnRegister, entry, member)
 	return true
 }
 
-func (r *Registry[K, M]) applyDeregister(entry K, member M, live map[K]map[M]struct{}, evictAt map[K]time.Time, now time.Time) bool {
-	set, exists := live[entry]
+func (r *Registry[K, M]) applyDeregister(entry K, member M, liveEntries map[K]map[M]struct{}, liveMembers map[M]map[K]struct{}, evictAt map[K]time.Time, now time.Time) bool {
+	set, exists := liveEntries[entry]
 	if !exists {
 		return false
 	}
@@ -382,6 +499,14 @@ func (r *Registry[K, M]) applyDeregister(entry K, member M, live map[K]map[M]str
 		return false
 	}
 	delete(set, member)
+
+	if memberEntries, memExists := liveMembers[member]; memExists {
+		delete(memberEntries, entry)
+		if len(memberEntries) == 0 {
+			delete(liveMembers, member)
+		}
+	}
+
 	safeCall2(r.hooks.OnDeregister, entry, member)
 	if len(set) > 0 {
 		return true
@@ -390,17 +515,17 @@ func (r *Registry[K, M]) applyDeregister(entry K, member M, live map[K]map[M]str
 		evictAt[entry] = now.Add(r.opts.Debounce)
 		return true
 	}
-	delete(live, entry)
+	delete(liveEntries, entry)
 	safeCall1(r.hooks.OnInactive, entry)
 	return true
 }
 
-func (r *Registry[K, M]) checkDebounce(now time.Time, live map[K]map[M]struct{}, evictAt map[K]time.Time) {
+func (r *Registry[K, M]) checkDebounce(now time.Time, liveEntries map[K]map[M]struct{}, evictAt map[K]time.Time) {
 	for entry, deadline := range evictAt {
 		if now.After(deadline) || now.Equal(deadline) {
-			set := live[entry]
+			set := liveEntries[entry]
 			if len(set) == 0 {
-				delete(live, entry)
+				delete(liveEntries, entry)
 				safeCall1(r.hooks.OnInactive, entry)
 			}
 			delete(evictAt, entry)
@@ -408,15 +533,15 @@ func (r *Registry[K, M]) checkDebounce(now time.Time, live map[K]map[M]struct{},
 	}
 }
 
-func (r *Registry[K, M]) publishSnapshot(live map[K]map[M]struct{}, dirty map[K]struct{}) {
+func (r *Registry[K, M]) publishSnapshot(liveEntries map[K]map[M]struct{}, dirty map[K]struct{}) {
 	prev := r.currentSnap.Load()
-	snapMembers := make(map[K][]M, len(live))
-	snapMemberSets := make(map[K]map[M]struct{}, len(live))
-	entries := make([]K, 0, len(live))
-	allSeen := make(map[M]struct{}, len(live)*2)
-	allMembers := make([]M, 0, len(live)*2)
+	snapMembers := make(map[K][]M, len(liveEntries))
+	snapMemberSets := make(map[K]map[M]struct{}, len(liveEntries))
+	entries := make([]K, 0, len(liveEntries))
+	allSeen := make(map[M]struct{}, len(liveEntries)*2)
+	allMembers := make([]M, 0, len(liveEntries)*2)
 
-	for entry, set := range live {
+	for entry, set := range liveEntries {
 		if len(set) == 0 {
 			continue // pending eviction with 0 members, omit from active snapshot
 		}
@@ -460,7 +585,7 @@ func (r *Registry[K, M]) publishSnapshot(live map[K]map[M]struct{}, dirty map[K]
 	})
 }
 
-func (r *Registry[K, M]) drainAndClose(batch []request[K, M], live map[K]map[M]struct{}) {
+func (r *Registry[K, M]) drainAndClose(batch []request[K, M], liveEntries map[K]map[M]struct{}, liveMembers map[M]map[K]struct{}) {
 	// Drain any remaining requests from reqCh into batch
 drainLoop:
 	for {
@@ -476,12 +601,12 @@ drainLoop:
 	if len(batch) > 0 {
 		now := time.Now()
 		evictAt := make(map[K]time.Time)
-		r.applyBatch(now, batch, live, evictAt)
+		r.applyBatch(now, batch, liveEntries, liveMembers, evictAt)
 		clear(batch)
 	}
 
 	// Clean up all remaining live entries: deregister remaining members and deactivate entries
-	for entry, set := range live {
+	for entry, set := range liveEntries {
 		if len(set) > 0 {
 			for member := range set {
 				safeCall2(r.hooks.OnDeregister, entry, member)
@@ -490,6 +615,7 @@ drainLoop:
 		safeCall1(r.hooks.OnInactive, entry)
 	}
 
+	clear(liveMembers)
 	r.currentSnap.Store(newEmptySnapshot[K, M]())
 }
 

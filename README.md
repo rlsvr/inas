@@ -123,7 +123,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Registry of topics (string) with client subscriber IDs (int)
+	// Registry of topic entries (string) with member IDs (int)
 	reg := registry.New[string, int](ctx, registry.Options{
 		ReconfigInterval: 10 * time.Millisecond,
 		Debounce:         5 * time.Second, // Keep topic warm for 5s after last member leaves
@@ -138,7 +138,7 @@ func main() {
 	defer func() { _ = reg.Close() }()
 
 	// Register member 42 into topic "chat-room"
-	unregister := reg.Register([]string{"chat-room"}, 42)
+	unregister := reg.Register("chat-room", 42)
 
 	// Sub-nanosecond lock-free snapshot inspection
 	snap := reg.Snapshot()

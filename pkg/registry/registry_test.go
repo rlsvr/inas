@@ -40,7 +40,7 @@ func TestRegistry_BasicLifecycle(t *testing.T) {
 	defer func() { _ = reg.Close() }()
 
 	// Register member 101 under entry-A and entry-B
-	unsub1 := reg.Register([]string{"entry-A", "entry-B"}, 101)
+	unsub1 := reg.RegisterMulti([]string{"entry-A", "entry-B"}, 101)
 
 	if activeCalls.Load() != 2 {
 		t.Fatalf("expected 2 OnActive calls, got %d", activeCalls.Load())
@@ -57,8 +57,8 @@ func TestRegistry_BasicLifecycle(t *testing.T) {
 		t.Fatal("expected entry-A to have member 101")
 	}
 
-	// Register member 102 under entry-A
-	unsub2 := reg.Register([]string{"entry-A"}, 102)
+	// Register member 102 under entry-A using single-entry Register(entry, member)
+	unsub2 := reg.Register("entry-A", 102)
 
 	// activeCalls should still be 2 (entry-A was already active)
 	if activeCalls.Load() != 2 {
@@ -94,6 +94,43 @@ func TestRegistry_BasicLifecycle(t *testing.T) {
 	}
 }
 
+func TestRegistry_DirectDeregister_SingleAndMember(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	reg := registry.New[string, string](ctx, registry.Options{
+		ReconfigInterval: 5 * time.Millisecond,
+		ReconfigWait:     true,
+	}, registry.Hooks[string, string]{})
+	defer func() { _ = reg.Close() }()
+
+	_ = reg.RegisterMulti([]string{"room-1", "room-2", "room-3"}, "alice")
+	_ = reg.Register("room-1", "bob")
+
+	if reg.MemberCount("room-1") != 2 || reg.MemberCount("room-2") != 1 || reg.MemberCount("room-3") != 1 {
+		t.Fatalf("unexpected counts: r1=%d r2=%d r3=%d", reg.MemberCount("room-1"), reg.MemberCount("room-2"), reg.MemberCount("room-3"))
+	}
+
+	// Selective deregistration: remove alice from room-2 only
+	reg.Deregister("room-2", "alice")
+	if reg.Snapshot().HasMember("room-2", "alice") {
+		t.Fatal("expected alice removed from room-2")
+	}
+	if !reg.Snapshot().HasMember("room-1", "alice") || !reg.Snapshot().HasMember("room-3", "alice") {
+		t.Fatal("expected alice still in room-1 and room-3")
+	}
+
+	// Blanket deregistration: remove alice from all remaining rooms
+	reg.DeregisterMember("alice")
+	if reg.Snapshot().HasMember("room-1", "alice") || reg.Snapshot().HasMember("room-3", "alice") {
+		t.Fatal("expected alice removed from all rooms")
+	}
+	// bob should still be in room-1
+	if !reg.Snapshot().HasMember("room-1", "bob") {
+		t.Fatal("expected bob still in room-1")
+	}
+}
+
 func TestRegistry_SliceMutationDefense(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -105,9 +142,9 @@ func TestRegistry_SliceMutationDefense(t *testing.T) {
 	defer func() { _ = reg.Close() }()
 
 	entries := []string{"topic-orig-1", "topic-orig-2"}
-	unsub := reg.Register(entries, 42)
+	unsub := reg.RegisterMulti(entries, 42)
 
-	// Mutate caller slice after Register
+	// Mutate caller slice after RegisterMulti
 	entries[0] = "mutated-1"
 	entries[1] = "mutated-2"
 
@@ -148,9 +185,9 @@ func TestRegistry_DuplicateMemberIdempotence(t *testing.T) {
 	})
 	defer func() { _ = reg.Close() }()
 
-	unsub1 := reg.Register([]string{"room"}, "alice")
+	unsub1 := reg.Register("room", "alice")
 	// Duplicate register of the same member
-	unsub2 := reg.Register([]string{"room"}, "alice")
+	unsub2 := reg.Register("room", "alice")
 
 	// OnRegister should only be called once
 	if regCalls.Load() != 1 {
@@ -196,7 +233,7 @@ func TestRegistry_DebounceAndRevival(t *testing.T) {
 	defer func() { _ = reg.Close() }()
 
 	// 1. First member joins
-	unsub1 := reg.Register([]string{"room-1"}, "alice")
+	unsub1 := reg.Register("room-1", "alice")
 	if activeCalls.Load() != 1 {
 		t.Fatalf("expected 1 OnActive call, got %d", activeCalls.Load())
 	}
@@ -216,7 +253,7 @@ func TestRegistry_DebounceAndRevival(t *testing.T) {
 
 	// 3. New member joins after 10ms (well within 40ms debounce)
 	time.Sleep(10 * time.Millisecond)
-	unsub2 := reg.Register([]string{"room-1"}, "bob")
+	unsub2 := reg.Register("room-1", "bob")
 
 	// OnActive should NOT be called again (topic was revived from debounce!)
 	if activeCalls.Load() != 1 {
@@ -253,8 +290,8 @@ func TestRegistry_AllMembersDeduplication(t *testing.T) {
 	}, registry.Hooks[string, string]{})
 	defer func() { _ = reg.Close() }()
 
-	unsub1 := reg.Register([]string{"topic-1", "topic-2"}, "client-A")
-	unsub2 := reg.Register([]string{"topic-2", "topic-3"}, "client-B")
+	unsub1 := reg.RegisterMulti([]string{"topic-1", "topic-2"}, "client-A")
+	unsub2 := reg.RegisterMulti([]string{"topic-2", "topic-3"}, "client-B")
 	defer unsub1()
 	defer unsub2()
 
@@ -287,7 +324,7 @@ func TestRegistry_ConcurrentRace(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < iterations; j++ {
 				topic := "topic-concurrent"
-				unsub := reg.Register([]string{topic}, workerID)
+				unsub := reg.Register(topic, workerID)
 				_ = reg.Snapshot().MemberCount(topic)
 				unsub()
 			}
@@ -316,7 +353,7 @@ func TestRegistry_CloseDrainsAndCleansUpMembers(t *testing.T) {
 		},
 	})
 
-	_ = reg.Register([]string{"channel-1", "channel-2"}, "user-1")
+	_ = reg.RegisterMulti([]string{"channel-1", "channel-2"}, "user-1")
 
 	// Close immediately; should invoke OnDeregister for the active member and OnInactive for both entries
 	if err := reg.Close(); err != nil {
@@ -351,7 +388,7 @@ func TestRegistry_DebounceStarvationUnderContinuousLoad(t *testing.T) {
 	defer func() { _ = reg.Close() }()
 
 	// Register and immediately deregister topic-A so it enters debounce eviction
-	unsubA := reg.Register([]string{"topic-A"}, "user-A")
+	unsubA := reg.Register("topic-A", "user-A")
 	unsubA()
 
 	// While topic-A is in debounce, continuously hammer topic-B with immediate flushes
@@ -365,7 +402,7 @@ func TestRegistry_DebounceStarvationUnderContinuousLoad(t *testing.T) {
 			case <-stopLoad:
 				return
 			default:
-				unsub := reg.Register([]string{"topic-B"}, string(rune('a'+(i%26))))
+				unsub := reg.Register("topic-B", string(rune('a'+(i%26))))
 				unsub()
 				i++
 			}
@@ -393,8 +430,8 @@ func TestRegistry_SliceClipSafety(t *testing.T) {
 	}, registry.Hooks[string, string]{})
 	defer func() { _ = reg.Close() }()
 
-	_ = reg.Register([]string{"clip-room-1", "clip-room-2"}, "alice")
-	_ = reg.Register([]string{"clip-room-1"}, "bob")
+	_ = reg.RegisterMulti([]string{"clip-room-1", "clip-room-2"}, "alice")
+	_ = reg.Register("clip-room-1", "bob")
 
 	snap := reg.Snapshot()
 	members := snap.Members("clip-room-1")
@@ -445,7 +482,7 @@ func TestRegistry_ActorPanicUnblocksCallers(t *testing.T) {
 	// Trigger the panic in actor
 	go func() {
 		defer func() { _ = recover() }()
-		_ = reg.Register([]string{"panic-topic"}, "user-p")
+		_ = reg.Register("panic-topic", "user-p")
 	}()
 
 	// Wait briefly for the actor to encounter the panic
@@ -454,7 +491,7 @@ func TestRegistry_ActorPanicUnblocksCallers(t *testing.T) {
 	// Now a second caller should not deadlock if it tries to register or unregister
 	done := make(chan struct{})
 	go func() {
-		_ = reg.Register([]string{"other-topic"}, "user-2")
+		_ = reg.Register("other-topic", "user-2")
 		close(done)
 	}()
 
@@ -484,7 +521,7 @@ func TestRegistry_DrainAndCloseWithPendingDeregister(t *testing.T) {
 		},
 	})
 
-	unsub := reg.Register([]string{"t1"}, "m1")
+	unsub := reg.Register("t1", "m1")
 	time.Sleep(10 * time.Millisecond)
 
 	// Fire unsub (enqueued in reqCh without waiting) and immediately Close

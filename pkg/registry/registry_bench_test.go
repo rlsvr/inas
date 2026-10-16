@@ -19,7 +19,7 @@ func BenchmarkRegistry_SnapshotRead(b *testing.B) {
 	defer func() { _ = reg.Close() }()
 
 	for i := 0; i < 100; i++ {
-		_ = reg.Register([]string{"feed-topic"}, i)
+		_ = reg.Register("feed-topic", i)
 	}
 
 	b.ResetTimer()
@@ -49,7 +49,7 @@ func BenchmarkRegistry_RegisterDeregister(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		unsub := reg.Register([]string{"topic-bench"}, i)
+		unsub := reg.Register("topic-bench", i)
 		unsub()
 	}
 }
